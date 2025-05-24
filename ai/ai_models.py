@@ -1873,13 +1873,14 @@ class AIAnalysisModule:
                 if not base64_image:
                     logger.warning(f"Failed to encode thumbnail {thumbnail_path} for clip {clip_id}.")
             except NameError:
-                 logger.error("optimize_and_encode_image function not available. Cannot provide image to AI.")
+                logger.error("optimize_and_encode_image function not available. Cannot provide image to AI.")
             except Exception as e:
                 logger.error(
                     f"Error preparing image for AI board analysis (clip {clip_id}): {e}", exc_info=True
-                base64_image = None ) Ensure it's None on error
+                )
+                base64_image = None  # Ensure it's None on error
         elif image_needed and not (thumbnail_path and os.path.exists(thumbnail_path)):
-             logger.warning(f"Thumbnail not found or path invalid for clip {clip_id}. Vision models may lack visual context.")
+            logger.warning(f"Thumbnail not found or path invalid for clip {clip_id}. Vision models may lack visual context.")
 
         # Base context prompt
         base_context = (
@@ -1958,12 +1959,10 @@ class AIAnalysisModule:
                     json_end = response_text.rfind("}")
                     if json_start != -1 and json_end != -1 and json_end > json_start:
                         clean_response = response_text[json_start : json_end + 1]
-                        parsed_data = json.loads(clean_response)
-
-                        # Validate required keys
+                        parsed_data = json.loads(clean_response)                        # Validate required keys
                         missing_keys = [k for k in task_details["output_keys"] if k not in parsed_data]
                         if missing_keys:
-                            raise ValueError(f"Missing expected JSON keys: {', '.join(missing_keys)}")
+                            raise ValueError(f"Missing expected JSON keys: {', '.join(missing_keys)}")raise ValueError(f"Missing expected JSON keys: {', '.join(missing_keys)}")
 
                         # Validate score types if applicable
                         score_key = task_details.get("score_key")
@@ -1989,18 +1988,203 @@ class AIAnalysisModule:
 
             except Exception as e:
                 logger.error(f"Clip {clip_id} - Member {member_key} - Task '{task_name}': Unexpected failure - {e}", exc_info=True)
-                return {"member_key": member_key, "task": task_name, "status": "error", "error": f"Unexpected error during task: {e}"}
+                return {"member_key": member_key, "task": task_name, "status": "error", "error": f"Unexpected error during task: {e}"}        # --- Execute Member Tasks Concurrently ---
+        member_task_results = []
+        
+        # Run all member tasks for all specified tasks
+        for task_name, task_details in tasks_to_run.items():
+            logger.debug(f"Clip {clip_id}: Starting task '{task_name}' for {len(members)} members")
+            
+            # Run tasks for all members for this task type
+            for member_info in members:
+                task_result = await run_single_member_task(member_info, task_name, task_details)
+                member_task_results.append(task_result)
+        
+        # Store raw member results in clip
+        clip["ai_board_raw_results"] = member_task_results
+        
+        # --- Synthesis Phase ---
+        if not member_task_results:
+            logger.warning(f"No member task results for clip {clip_id}. Setting error status.")
+            clip["ai_board_error"] = "No member task results available."
+            clip["ai_board_status"] = "analysis_failed"
+            return clip
+        
+        # Categorize results by task and status
+        successful_results = {}
+        failed_results = {}
+        
+        for result in member_task_results:
+            task = result["task"]
+            status = result.get("status", "unknown")
+            
+            if status == "success":
+                successful_results.setdefault(task, []).append(result)
+            else:
+                failed_results.setdefault(task, []).append(result)
+        
+        # Synthesize results for each task
+        for task_name, task_details in tasks_to_run.items():
+            task_successes = successful_results.get(task_name, [])
+            
+            if not task_successes:
+                logger.warning(f"Clip {clip_id}: No successful results for task '{task_name}'")
+                continue
+            
+            # Extract scores and other data from successful results
+            if task_details.get("score_key"):
+                scores = [r["result"][task_details["score_key"]] for r in task_successes 
+                         if task_details["score_key"] in r.get("result", {})]
+                if scores:
+                    # Use median score as the synthesized score
+                    import statistics
+                    synthesized_score = round(statistics.median(scores))
+                    clip[f"ai_{task_name.replace('_analysis', '')}_score"] = synthesized_score
+            
+            # Aggregate tags/recommendations
+            all_tags = []
+            all_recommendations = []
+            
+            for result in task_successes:
+                result_data = result.get("result", {})
+                
+                # Collect tags
+                tags_key = f"{task_name.replace('_analysis', '')}_tags"
+                if tags_key in result_data:
+                    tags = result_data[tags_key]
+                    if isinstance(tags, list):
+                        all_tags.extend(tags)
+                    elif isinstance(tags, str):
+                        all_tags.append(tags)
+                
+                # Collect recommendations
+                recs_key = f"{task_name.replace('_analysis', '')}_recommendations"
+                if recs_key in result_data:
+                    recs = result_data[recs_key]
+                    if isinstance(recs, list):
+                        all_recommendations.extend(recs)
+                    elif isinstance(recs, str):
+                        all_recommendations.append(recs)
+            
+            # Deduplicate and store aggregated data
+            if all_tags:
+                unique_tags = list(set(tag.strip() for tag in all_tags if tag and tag.strip()))
+                clip.setdefault("ai_tags", []).extend(unique_tags)
+            
+            if all_recommendations:
+                unique_recs = list(set(rec.strip() for rec in all_recommendations if rec and rec.strip()))
+                clip.setdefault("ai_recommendations", []).extend(unique_recs)
+        
+        # Remove duplicates from final aggregated lists
+        if "ai_tags" in clip:
+            clip["ai_tags"] = list(set(clip["ai_tags"]))
+        if "ai_recommendations" in clip:
+            clip["ai_recommendations"] = list(set(clip["ai_recommendations"]))
+        
+        # --- Chairperson Summary (if configured) ---
+        if chairperson_config and successful_results:
+            try:
+                summary_prompt = (
+                    f"{base_context}\n\n"
+                    f"Task: As the board chairperson, provide a concise summary of the AI Board analysis results. "
+                    f"The following tasks were completed: {list(successful_results.keys())}. "
+                    f"Synthesized scores: "
+                )
+                
+                # Add synthesized scores to prompt
+                for task_name in tasks_to_run.keys():
+                    score_key = f"ai_{task_name.replace('_analysis', '')}_score"
+                    score = clip.get(score_key)
+                    if score is not None:
+                        summary_prompt += f"{task_name.replace('_', ' ').title()}: {score}/100. "
+                
+                summary_prompt += (
+                    f"\n\nProvide a brief (2-3 sentence) executive summary of this clip's potential "
+                    f"based on the board's analysis. Focus on key insights and actionable recommendations."
+                )
+                
+                # Determine if chairperson model supports images
+                chairperson_images = None
+                chairperson_model_info = self.model_registry.get_model_info(
+                    chairperson_config["provider"], chairperson_config["model"]
+                )
+                if base64_image and chairperson_model_info and "image" in chairperson_model_info.get("capabilities", []):
+                    chairperson_images = [base64_image]
+                
+                summary_response = await self.model_manager.analyze_with_model(
+                    provider=chairperson_config["provider"],
+                    model_name=chairperson_config["model"],
+                    prompt=summary_prompt,
+                    images=chairperson_images,
+                    temperature=0.4,  # Lower temperature for summary
+                    max_tokens=200,   # Shorter summary
+                    timeout=DEFAULT_API_TIMEOUT,
+                    format_type="text"
+                )
+                
+                if not summary_response.startswith("Error:"):
+                    clip["ai_board_summary"] = summary_response.strip()
+                    logger.debug(f"Clip {clip_id}: Chairperson summary generated successfully")
+                else:
+                    logger.error(f"Clip {clip_id}: Chairperson summary failed: {summary_response}")
+                    clip["ai_board_synthesis_error"] = summary_response
+                    
+            except Exception as summary_err:
+                logger.error(f"Clip {clip_id}: Error generating chairperson summary: {summary_err}", exc_info=True)
+                clip["ai_board_synthesis_error"] = f"Summary generation failed: {summary_err}"
+          # Set final status
+        if successful_results:
+            clip["ai_board_status"] = "completed"
+            logger.info(f"Clip {clip_id}: AI Board analysis completed successfully")
+        else:
+            clip["ai_board_status"] = "analysis_failed"
+            clip["ai_board_error"] = "All member analyses failed"
+            logger.warning(f"Clip {clip_id}: AI Board analysis failed - no successful member results")
+        
+        return clip
 
+    def _display_clip_details(self, clip: Dict):
+        """Helper method to display basic clip information in Streamlit."""
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write(f"**Duration:** {clip.get('start', 0):.1f}s - {clip.get('end', 0):.1f}s")
+            st.write(f"**Score:** {clip.get('score', 'N/A')}")
+            st.write(f"**Tag:** {clip.get('tag', 'N/A')}")
+        
+        with col2:
+            st.write(f"**Category:** {clip.get('category', 'N/A')}")
+            st.write(f"**Quip:** {clip.get('quip', 'N/A')}")
+            if thumbnail := clip.get('thumbnail'):
+                if os.path.exists(thumbnail):
+                    st.image(thumbnail, caption="Thumbnail", width=150)
 
-        # --- Execute Member Tasks Concurrently ---
-        # WARNING: Running multiple concurrent asyncio tasks within a single ThreadPoolExecutor thread
-        #          submitted from Streamlit's main thread can be complex and potentially lead to issues
-        #          like deadlocks or loop conflicts if not managed carefully.
-        #          Consider alternative architectures if performance/stability issues arise.
-        #          For this refactor, we stick to a simpler (potentially blocking) sequential approach.
-        #
-        # A simple sequential approach:
-        updated_project_clips = [] # Collect updated clips
+    async def run_batch_ai_analysis(self, clips: List[Dict], project: Dict, board_config: Dict) -> Dict:
+        """
+        Runs AI Board analysis for multiple clips with progress tracking.
+        
+        Args:
+            clips: List of clip dictionaries
+            project: Project data dictionary
+            board_config: AI Board configuration
+        
+        Returns:
+            Dictionary with analysis results and statistics
+        """
+        if not clips:
+            return {"status": "error", "message": "No clips provided for analysis"}
+        
+        if not board_config.get("board_enabled") or not board_config.get("board_members"):
+            return {"status": "error", "message": "AI Board not enabled or no members configured"}
+        
+        # Create progress tracking UI elements
+        status_placeholder = st.empty()
+        progress_bar = st.progress(0)
+        
+        processed_count = 0
+        error_count = 0
+        updated_clips = []
+        
         try:
             for i, clip_data in enumerate(clips):
                 clip_id = clip_data.get("id", f"index_{i}")
@@ -2008,151 +2192,60 @@ class AIAnalysisModule:
 
                 # Run the async analysis function for the current clip
                 try:
-                     # asyncio.run creates its own event loop
-                     # This will BLOCK the Streamlit thread until run_ai_board_analysis_for_clip completes
-                     updated_clip = asyncio.run(
-                          self.run_ai_board_analysis_for_clip(
-                              clip_data.copy(), project, board_config
-                          )
-                     )
-                     updated_project_clips.append(updated_clip)
+                    updated_clip = await self.run_ai_board_analysis_for_clip(
+                        clip_data.copy(), project, board_config
+                    )
+                    updated_clips.append(updated_clip)
 
-                     # Optional: Save results immediately to DB (if function exists)
-                     if update_clip_data(updated_clip["id"], updated_clip):
-                         logger.debug(f"Saved AI Board results for clip {updated_clip['id']} to DB.")
-                     else:
-                         logger.error(f"Failed to save AI Board results for clip {updated_clip['id']} to DB.")
-                     processed_count += 1
+                    # Optional: Save results immediately to DB (if function exists)
+                    if update_clip_data(updated_clip["id"], updated_clip):
+                        logger.debug(f"Saved AI Board results for clip {updated_clip['id']} to DB.")
+                    else:
+                        logger.error(f"Failed to save AI Board results for clip {updated_clip['id']} to DB.")
+                    
+                    processed_count += 1
 
-                     if updated_clip.get("ai_board_status") != "completed":
-                          error_count += 1
+                    if updated_clip.get("ai_board_status") != "completed":
+                        error_count += 1
 
                 except Exception as analysis_exc:
-                     logger.error(f"Fatal error running AI Board analysis for clip {clip_id}: {analysis_exc}", exc_info=True)
-                     error_count += 1
-                     # Add error info to the original clip and append it
-                     clip_data["ai_board_error"] = f"Analysis execution failed: {analysis_exc}"
-                     clip_data["ai_board_status"] = "execution_error"
-                     updated_project_clips.append(clip_data)
+                    logger.error(f"Fatal error running AI Board analysis for clip {clip_id}: {analysis_exc}", exc_info=True)
+                    error_count += 1
+                    # Add error info to the original clip and append it
+                    clip_data["ai_board_error"] = f"Analysis execution failed: {analysis_exc}"
+                    clip_data["ai_board_status"] = "execution_error"
+                    updated_clips.append(clip_data)
 
                 # Update progress bar
                 progress = (i + 1) / len(clips)
                 progress_bar.progress(progress, text=f"Analyzed {i+1}/{len(clips)} clips...")
 
-            # Update the project dictionary in session state or trigger a reload
-            # For now, assume the caller handles project state update based on updated_project_clips
-            # A common pattern is to update the database and then st.rerun()
-
             status_placeholder.success(f"AI Board analysis complete. Processed: {processed_count}, Errors: {error_count}.")
             progress_bar.progress(1.0, text="Analysis Complete!")
-            time.sleep(2) # Allow user to see completion message
+            
+            # Clean up UI elements after a brief display
+            time.sleep(2)
             progress_bar.empty()
             status_placeholder.empty()
 
-            # Force Streamlit to rerun the script to reflect updated clip data
-            # This assumes clip data is reloaded from the source (e.g., DB) at the start of the script
-            st.rerun()
+            return {
+                "status": "completed",
+                "processed_count": processed_count,
+                "error_count": error_count,
+                "updated_clips": updated_clips
+            }
 
         except Exception as e:
-             logger.error(f"Error during AI Board batch analysis trigger: {e}", exc_info=True)
-             st.error(f"An error occurred during the analysis process: {e}")
-             progress_bar.empty() # Clear progress bar on outer error
-             status_placeholder.empty()
-
-        # --- Display Results ---
-        st.markdown("#### Clip Analysis Results:")
-
-        # Sort clips (e.g., by start time or score) for consistent display
-        display_clips = sorted(clips, key=lambda c: c.get("start", 0))
-
-        if not display_clips:
-            st.info("No clips available to display results.")
-            return
-
-        # Use session state to manage expander states if needed, or rely on Streamlit's default behavior
-        # Example without explicit state management (simpler):
-        for clip in display_clips:
-            clip_id = clip["id"]
-            ai_status = clip.get("ai_board_status") # 'completed', 'synthesis_failed', 'analysis_failed', 'execution_error', or None
-
-            # Create expander label based on status
-            expander_label = f"Clip @ {clip.get('start', 0):.1f}s - {clip.get('end', 0):.1f}s"
-            if tag := clip.get("tag"): expander_label += f": {tag}"
-
-            if ai_status == "completed":
-                viral = clip.get('ai_viral_score')
-                monet = clip.get('ai_monetization_score')
-                score_label = f" (AI Scores: V={viral if viral is not None else 'N/A'}, M={monet if monet is not None else 'N/A'})"
-                expander_label += score_label
-            elif ai_status:
-                 expander_label += f" (Status: {ai_status.replace('_', ' ').title()})"
-            else:
-                 expander_label += " (Analysis Not Run)"
-
-            # Use a unique key for the expander
-            expander_key = f"ai_board_expander_{project_id}_{clip_id}"
-            with st.expander(expander_label, expanded=False): # Default to collapsed
-
-                # Display basic clip info using the helper
-                self._display_clip_details(clip)
-                st.markdown("---")
-
-                # Display AI Board results or status
-                if ai_status == "completed":
-                    st.markdown("##### AI Board Synthesized Results:")
-                    ai_viral = clip.get("ai_viral_score")
-                    ai_monetize = clip.get("ai_monetization_score")
-
-                    # Display scores if available
-                    score_cols = st.columns(2)
-                    with score_cols[0]:
-                        st.metric("AI Viral Score", ai_viral if ai_viral is not None else "N/A")
-                    with score_cols[1]:
-                        st.metric("AI Monetization Score", ai_monetize if ai_monetize is not None else "N/A")
-
-                    # Display tags
-                    ai_tags = clip.get("ai_tags", [])
-                    if ai_tags:
-                        st.markdown("**Consolidated AI Tags:**")
-                        # Simple bullet points for tags
-                        st.write(", ".join(ai_tags))
-                        # Alternative styled tags:
-                        # tag_html = " ".join(f"<span style='display:inline-block; background-color:#444; color: #eee; padding: 1px 5px; border-radius:10px; margin-right:3px; margin-bottom:3px; font-size:0.8em;'>{tag}</span>" for tag in ai_tags)
-                        # st.markdown(tag_html, unsafe_allow_html=True)
-
-                    # Display recommendations
-                    ai_recs = clip.get("ai_recommendations", [])
-                    if ai_recs:
-                        st.markdown("**Consolidated AI Recommendations:**")
-                        for rec in ai_recs:
-                            st.markdown(f"- {rec}")
-
-                    # Display summary
-                    ai_summary = clip.get("ai_board_summary")
-                    if ai_summary:
-                        st.markdown("**Chairperson Summary:**")
-                        st.markdown(f"> {ai_summary}")
-
-                    # Optionally show raw results in another expander
-                    raw_results = clip.get("ai_board_raw_results")
-                    if raw_results:
-                        with st.expander("View Raw Board Member Results"):
-                            st.json(raw_results, expanded=False)
-
-                elif ai_status:
-                    # Display errors if analysis failed or had issues
-                    st.error(f"AI Board analysis status: {ai_status.replace('_', ' ').title()}")
-                    if error_msg := clip.get("ai_board_error"):
-                        st.error(f"Board Error: {error_msg}")
-                    if synth_error_msg := clip.get("ai_board_synthesis_error"):
-                        st.error(f"Synthesis Error: {synth_error_msg}")
-                    # Optionally show raw results even on failure
-                    raw_results = clip.get("ai_board_raw_results")
-                    if raw_results:
-                        with st.expander("View Raw Board Member Results (May be incomplete)"):
-                            st.json(raw_results, expanded=False)
-                else:
-                    st.info("AI Board analysis has not been run for this clip yet.")
+            logger.error(f"Error during AI Board batch analysis: {e}", exc_info=True)
+            progress_bar.empty()
+            status_placeholder.empty()
+            return {
+                "status": "error", 
+                "message": f"Batch analysis failed: {e}",
+                "processed_count": processed_count,
+                "error_count": error_count,
+                "updated_clips": updated_clips
+            }
 
 
     async def close(self):

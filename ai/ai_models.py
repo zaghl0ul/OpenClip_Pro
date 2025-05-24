@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import binascii
 import concurrent.futures  # Used for running async code in sync contexts
 import json
 import logging
@@ -25,6 +26,12 @@ try:
 except ImportError:
     logger.error("cryptography package not installed. API key encryption will not work.")
     Fernet = None  # Set to None so we can check if it's available
+
+
+# --- Utility Functions ---
+def debug_print(message: str):
+    """Debug print function to replace missing debug_print calls."""
+    logger.debug(message)
 
 
 # --- Configuration ---
@@ -95,12 +102,19 @@ except ImportError:
 # Google Generative AI
 try:
     import google.generativeai as genai
+    from google.generativeai.types import GenerationConfig
     from google.api_core import exceptions as GoogleAPIErrors
-except ImportError:
+    # Verify the import worked by checking for key attributes
+    if not hasattr(genai, 'configure'):
+        raise ImportError("google.generativeai.configure not found")
+    if not hasattr(genai, 'GenerativeModel'):
+        raise ImportError("google.generativeai.GenerativeModel not found")
+except ImportError as e:
     genai = None
+    GenerationConfig = None
     GoogleAPIErrors = None
     logger.warning(
-        "google-generativeai package not found. Gemini models will not be available."
+        f"google-generativeai package not found or incomplete: {e}. Gemini models will not be available."
     )
 
 # Ollama
@@ -429,11 +443,15 @@ class GeminiIntegration:
     Note: The underlying `genai.configure` is global. This class manages
     setting the key for the application's context.
     """
-
+    
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
         self.genai = genai  # Use the globally imported module
         self.initialized = False
+        self._cached_models = None
+        self._cache_timestamp = 0
+        self._cache_duration = 300  # Cache for 5 minutes
+        
         if self.genai and self.api_key:
             self._configure()
         elif not self.genai:
@@ -450,7 +468,7 @@ class GeminiIntegration:
 
         try:
             # This configures the genai module globally for subsequent calls.
-            self.genai.configure(api_key=self.api_key)
+            genai.configure(api_key=self.api_key)
             self.initialized = True
             logger.info("Google Generative AI (Gemini) API configured successfully.")
             return True
@@ -498,7 +516,7 @@ class GeminiIntegration:
                 return "Error: Gemini API not configured or API key missing."
 
         try:
-            model = self.genai.GenerativeModel(model_name)
+            model = genai.GenerativeModel(model_name)
             content_parts = []
 
             # Prepare image parts
@@ -511,7 +529,7 @@ class GeminiIntegration:
                         content_parts.append(
                             {"mime_type": "image/jpeg", "data": img_bytes}
                         )
-                    except (base64.binascii.Error, ValueError) as img_err:
+                    except (binascii.Error, ValueError) as img_err:
                         logger.error(
                             f"Error decoding base64 image for Gemini: {img_err}",
                             exc_info=True,
@@ -521,7 +539,7 @@ class GeminiIntegration:
             # Add text part
             content_parts.append({"text": prompt})
 
-            generation_config = self.genai.types.GenerationConfig(
+            generation_config = genai.types.GenerationConfig(
                 max_output_tokens=max_tokens,
                 temperature=temperature,
                 # Add other relevant config if needed (top_p, top_k)
@@ -621,6 +639,99 @@ class GeminiIntegration:
                 exc_info=True,
             )
             return f"Error: Unexpected error during Gemini analysis ({type(e).__name__})."
+
+    def list_available_models(self) -> List[str]:
+        """
+        Fetch available Gemini models from the API with caching.
+        
+        Returns:
+            List of available model names, or empty list if failed.
+        """
+        # Check cache validity
+        current_time = time.time()
+        if (self._cached_models is not None and 
+            current_time - self._cache_timestamp < self._cache_duration):
+            logger.debug("Using cached Gemini models list")
+            return self._cached_models
+        
+        # Fetch fresh models from API
+        if not self.initialized or not self.genai:
+            logger.warning("Gemini not configured, cannot fetch models")
+            return []
+        
+        try:            # Use genai.list_models() to fetch available models
+            models = genai.list_models()
+            model_names = []
+            
+            for model in models:
+                # Extract model name from the full model path
+                # Model names come as "models/gemini-1.5-pro" format
+                if hasattr(model, 'name'):
+                    model_name = model.name
+                    if model_name.startswith('models/'):
+                        model_name = model_name[7:]  # Remove "models/" prefix
+                    model_names.append(model_name)
+            
+            # Cache the results
+            self._cached_models = model_names
+            self._cache_timestamp = current_time
+            
+            logger.info(f"Successfully fetched {len(model_names)} Gemini models from API")
+            return model_names
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch Gemini models from API: {e}", exc_info=True)
+            return []
+
+    def get_model_info_from_api(self, model_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed information about a specific model from the API.
+        
+        Args:
+            model_name: The model name to get info for
+            
+        Returns:
+            Dictionary with model info or None if failed
+        """
+        if not self.initialized or not self.genai:
+            return None
+            
+        try:
+            # Get model info from API
+            full_model_name = f"models/{model_name}" if not model_name.startswith("models/") else model_name
+            model_info = genai.get_model(full_model_name)
+            
+            # Extract relevant information and convert to our format
+            capabilities = ["text"]  # All Gemini models support text
+            
+            # Check if model supports vision (images)
+            if hasattr(model_info, 'supported_generation_methods'):
+                if any('Vision' in str(method) for method in model_info.supported_generation_methods):
+                    capabilities.append("image")
+            else:
+                # For newer models, assume vision capability if name suggests it
+                if any(keyword in model_name.lower() for keyword in ['vision', 'pro', 'flash']):
+                    capabilities.append("image")
+            
+            # Determine quality tier based on model name
+            quality = "standard"
+            if "pro" in model_name.lower():
+                quality = "premium"
+            elif "flash" in model_name.lower():
+                quality = "fast"
+            
+            return {
+                "provider": "Google",
+                "type": "vision" if "image" in capabilities else "text",
+                "quality": quality,
+                "requires_api_key": True,
+                "capabilities": capabilities,
+                "dynamic": True,  # Mark as dynamically fetched
+            }
+            
+        except Exception as e:
+            logger.debug(f"Could not fetch detailed info for model {model_name}: {e}")
+            return None
 
 
 # --- AI Model Registry ---
@@ -762,120 +873,179 @@ class ModelRegistry:
         # Add other providers (e.g., HuggingFace) here if needed
     }
 
-    def list_providers(self) -> List[str]:
-        """Lists provider names (display format) based on available models."""
-        # Extract unique, formatted provider names
-        providers = set(
-            info.get("provider", p.capitalize())
-            for p, models in self.KNOWN_MODELS.items() for _, info in models.items()
-        )
-        return sorted(list(providers))
+    def __init__(self, key_manager: Optional['APIKeyManager'] = None):
+        """Initialize ModelRegistry with optional dynamic model support."""
+        self.key_manager = key_manager
+        self._gemini_integration = None
+        self._dynamic_models_cache = {}
+        self._cache_timestamps = {}
+        self._cache_duration = 300  # 5 minutes cache
+
+    def _get_gemini_integration(self):
+        """Get or create a GeminiIntegration instance for dynamic model fetching."""
+        if not self._gemini_integration and self.key_manager:
+            api_key = self.key_manager.get_key("google")
+            if api_key:
+                self._gemini_integration = GeminiIntegration(api_key)
+        return self._gemini_integration
+
+    def _get_dynamic_gemini_models(self) -> List[Dict]:
+        """Fetch dynamic Gemini models from the API."""
+        # Check cache first
+        current_time = time.time()
+        if ("google" in self._dynamic_models_cache and 
+            current_time - self._cache_timestamps.get("google", 0) < self._cache_duration):
+            return self._dynamic_models_cache["google"]
+
+        dynamic_models = []
+        gemini_integration = self._get_gemini_integration()
+        
+        if gemini_integration and gemini_integration.initialized:
+            try:
+                model_names = gemini_integration.list_available_models()
+                logger.info(f"Fetched {len(model_names)} dynamic Gemini models from API")
+                
+                for model_name in model_names:
+                    # Get detailed info for each model
+                    model_info = gemini_integration.get_model_info_from_api(model_name)
+                    if model_info:
+                        dynamic_models.append({
+                            "model": model_name,
+                            "provider": "Google",
+                            **model_info
+                        })
+                    else:
+                        # Fallback info if detailed fetch fails
+                        dynamic_models.append({
+                            "model": model_name,
+                            "provider": "Google",
+                            "type": "vision",
+                            "quality": "standard",
+                            "requires_api_key": True,
+                            "capabilities": ["text", "image"],
+                            "dynamic": True
+                        })
+                
+                # Cache the results
+                self._dynamic_models_cache["google"] = dynamic_models
+                self._cache_timestamps["google"] = current_time
+                
+            except Exception as e:
+                logger.warning(f"Failed to fetch dynamic Gemini models: {e}")
+        
+        return dynamic_models
 
     def list_models_for_provider(self, provider_name_or_key: str) -> List[str]:
-        """Lists model names for a specific provider (case-insensitive lookup)."""
+        """Lists model names for a specific provider, including dynamic models."""
         provider_key = provider_name_or_key.lower()
-        return sorted(list(self.KNOWN_MODELS.get(provider_key, {}).keys()))
+        
+        # Get static models
+        static_models = sorted(list(self.KNOWN_MODELS.get(provider_key, {}).keys()))
+        
+        # For Google/Gemini, also fetch dynamic models
+        if provider_key == "google":
+            dynamic_models = self._get_dynamic_gemini_models()
+            dynamic_model_names = [m["model"] for m in dynamic_models]
+            
+            # Combine static and dynamic models, remove duplicates
+            all_models = static_models + [name for name in dynamic_model_names if name not in static_models]
+            return sorted(all_models)
+        
+        return static_models
 
     def get_model_info(self, provider_name_or_key: str, model_name: str) -> Optional[Dict]:
-        """Gets detailed info for a specific model (case-insensitive provider lookup)."""
+        """Gets detailed info for a specific model, checking both static and dynamic sources."""
         provider_key = provider_name_or_key.lower()
+        
+        # First check static models
+        static_info = self.KNOWN_MODELS.get(provider_key, {}).get(model_name)
+        if static_info:
+            return static_info
+        
+        # For Google/Gemini, check dynamic models
+        if provider_key == "google":
+            dynamic_models = self._get_dynamic_gemini_models()
+            for model in dynamic_models:
+                if model.get("model") == model_name:
+                    # Return a copy without the "model" key to match expected format
+                    model_info = {k: v for k, v in model.items() if k != "model"}
+                    return model_info
+        
+        # Standard lookup for models without tags
         return self.KNOWN_MODELS.get(provider_key, {}).get(model_name)
-
-    def list_all_models_structured(self) -> Dict[str, List[Dict]]:
-        """Returns a structured dict: {'ProviderName': [{'model': name, ...info}, ...]}."""
-        structured = {}
-        for provider_key, models in self.KNOWN_MODELS.items():
-            provider_display_name = provider_key.capitalize()
-            # Get display name from first model entry if available, fallback to capitalized key
-            if models:
-                 provider_display_name = next(iter(models.values())).get("provider", provider_display_name)
-
-            model_list = []
-            for name, info in models.items():
-                 model_list.append({"model": name, **info})
-
-            if model_list:
-                structured[provider_display_name] = sorted(model_list, key=lambda m: m['model'])
-        return structured
 
 
     def list_vision_models(self) -> List[Dict]:
-        """Lists all models supporting image input, including provider and name."""
+        """Lists all models supporting image input, including dynamic models."""
         vision_models = []
+        
+        # Get static vision models
         for provider_key, models in self.KNOWN_MODELS.items():
             for name, info in models.items():
                 if "image" in info.get("capabilities", []):
                     vision_models.append(
                         {"provider": info.get("provider", provider_key.capitalize()), "model": name, **info}
                     )
-        return vision_models
         
+        # Add dynamic Gemini vision models
+        dynamic_gemini_models = self._get_dynamic_gemini_models()
+        for model in dynamic_gemini_models:
+            if "image" in model.get("capabilities", []):
+                vision_models.append(model)
+        
+        return vision_models
+
+    def list_all_models_structured(self) -> Dict[str, List[Dict]]:
+        """Returns a structured dict including dynamic models."""
+        structured = {}
+        
+        # Process static models
+        for provider_key, models in self.KNOWN_MODELS.items():
+            provider_display_name = provider_key.capitalize()
+            if models:
+                provider_display_name = next(iter(models.values())).get("provider", provider_display_name)
+
+            model_list = []
+            for name, info in models.items():
+                model_list.append({"model": name, **info})
+
+            if model_list:
+                structured[provider_display_name] = sorted(model_list, key=lambda m: m['model'])
+        
+        # Add dynamic Gemini models
+        dynamic_gemini_models = self._get_dynamic_gemini_models()
+        if dynamic_gemini_models:
+            google_models = structured.get("Google", [])
+            # Add dynamic models that aren't already in static list
+            existing_model_names = {m["model"] for m in google_models}
+            for model in dynamic_gemini_models:
+                if model["model"] not in existing_model_names:
+                    google_models.append(model)
+            
+            structured["Google"] = sorted(google_models, key=lambda m: m['model'])
+        
+        return structured
+
     def list_free_models(self) -> List[Dict]:
-        """Lists models that are free to use (no API key required or explicitly marked as free)."""
+        """Returns a list of models that are free to use (no API key required or explicitly marked as free)."""
         free_models = []
+        
+        # Check static models
         for provider_key, models in self.KNOWN_MODELS.items():
             for name, info in models.items():
-                # Include model if it doesn't require an API key or is explicitly marked as free
-                if not info.get("requires_api_key", True) or info.get("is_free", False):
-                    free_models.append(
-                        {"provider": info.get("provider", provider_key.capitalize()), "model": name, **info}
-                    )
-        return free_models
-
-    def list_models_requiring_keys(self) -> List[Dict]:
-        """Lists models that require an API key."""
-        key_models = []
-        for provider_key, models in self.KNOWN_MODELS.items():
-             for name, info in models.items():
-                if info.get("requires_api_key", False) is True:
-                     key_models.append(
-                        {"provider": info.get("provider", provider_key.capitalize()), "model": name, **info}
-                    )
-        return key_models
-
-    def list_local_models(self) -> List[Dict]:
-        """Lists models that typically run locally (no API key needed)."""
-        local_models = []
-        for provider_key, models in self.KNOWN_MODELS.items():
-             for name, info in models.items():
-                if info.get("requires_api_key", True) is False:
-                    local_models.append(
-                        {"provider": info.get("provider", provider_key.capitalize()), "model": name, **info}
-                    )
-        return local_models
-
-    def get_model_info(self, provider: str, model_name: str) -> Optional[Dict[str, Any]]:
-        """Get model info by provider and model name."""
-        provider_lower = provider.lower().strip()
-        model_lower = model_name.lower().strip()
+                # Consider a model free if it's explicitly marked as free OR doesn't require an API key
+                is_free = info.get("is_free", False) or not info.get("requires_api_key", True)
+                if is_free:
+                    free_models.append({
+                        "provider": info.get("provider", provider_key.capitalize()),
+                        "model": name,
+                        **info
+                    })
         
-        # Special handling for Ollama models with tags (e.g., llava:latest)
-        if provider_lower == "ollama" and ":" in model_lower:
-            base_model = model_lower.split(":")[0]
-            # First try exact match with the tag
-            model_info = self.KNOWN_MODELS.get(provider_lower, {}).get(model_lower)
-            # Then try with just the base model name if not found
-            if not model_info:
-                model_info = self.KNOWN_MODELS.get(provider_lower, {}).get(base_model)
-            
-            # If still not found, return a default model info for Ollama with vision capability
-            if not model_info:
-                logger.info(f"Using default model info for unknown Ollama model: {model_lower}")
-                return {
-                    "name": model_lower,
-                    "provider": provider_lower,
-                    "requires_api_key": False,
-                    "capabilities": ["text", "image"],
-                    "context_window": 4096,
-                    "supports_functions": False,
-                    "supports_json": False,
-                    "max_tokens": 4096,
-                    "cost_per_token": 0.0,
-                }
-            return model_info
-            
-        # Standard lookup for models without tags
-        return self.KNOWN_MODELS.get(provider_lower, {}).get(model_lower)
+        # Note: Dynamic Gemini models typically require API keys, so they won't be included
+        # unless specifically marked as free in the API response
+        
+        return free_models
 
 
 # --- AI Client Factory ---
@@ -906,7 +1076,7 @@ class AIClientFactory:
             An initialized client instance (e.g., AsyncOpenAI, GeminiIntegration).
 
         Raises:
-            ValueError: If provider is unsupported or API key is required but missing.
+            ValueError: If provider is unsupported or API key is required but not found.
             ImportError: If the required SDK package is not installed.
             ConnectionError: If connection to a local service (like Ollama) fails.
             RuntimeError: For unexpected initialization errors.
@@ -1289,9 +1459,7 @@ Make sure the Ollama service is running before attempting analysis."""
             elif hasattr(e, "__module__") and "ollama" in getattr(e, "__module__", ""):
                 # Special handling for Ollama errors that might be related to LLaVA
                 if "llava" in model_name.lower():
-                    if "not found" in str(e).lower():
-                        return f"Error: LLaVA model not found. Use 'ollama pull llava' to install it."
-                    return f"Error: LLaVA model error - {type(e).__name__}: {e}. Make sure you've run 'ollama pull llava'."
+                    return f"Error: LLaVA model not found. Use 'ollama pull llava' to install it."
                 return f"Error: Ollama API call failed ({type(e).__name__}). Details: {e}"
             elif isinstance(e, asyncio.TimeoutError):
                 return f"Error: Operation timed out ({timeout}s)."
@@ -1636,7 +1804,7 @@ Make sure the Ollama service is running before attempting analysis."""
         logger.info("AIModelManager resources shut down.")
 
 
-# --- Main AI Analysis Module ---
+# --- AI Analysis Module ---
 class AIAnalysisModule:
     """Orchestrates AI analysis tasks, including the AI Board feature."""
 
@@ -1709,7 +1877,6 @@ class AIAnalysisModule:
             except Exception as e:
                 logger.error(
                     f"Error preparing image for AI board analysis (clip {clip_id}): {e}", exc_info=True
-                )
                 base64_image = None # Ensure it's None on error
         elif image_needed and not (thumbnail_path and os.path.exists(thumbnail_path)):
              logger.warning(f"Thumbnail not found or path invalid for clip {clip_id}. Vision models may lack visual context.")
@@ -1830,289 +1997,67 @@ class AIAnalysisModule:
         #          submitted from Streamlit's main thread can be complex and potentially lead to issues
         #          like deadlocks or loop conflicts if not managed carefully.
         #          Consider alternative architectures if performance/stability issues arise.
-        member_task_coroutines = []
-        for member_info in members:
-            for task_name, task_details in tasks_to_run.items():
-                member_task_coroutines.append(
-                    run_single_member_task(member_info, task_name, task_details)
-                )
+        #          For this refactor, we stick to a simpler (potentially blocking) sequential approach.
+        #
+        # A simple sequential approach:
+        updated_project_clips = [] # Collect updated clips
+        try:
+            for i, clip_data in enumerate(clips):
+                clip_id = clip_data.get("id", f"index_{i}")
+                status_placeholder.text(f"Analyzing clip {i+1}/{len(clips)} (ID: {clip_id})...")
 
-        member_results_list = []
-        if member_task_coroutines:
-            logger.info(f"Clip {clip_id}: Gathering {len(member_task_coroutines)} AI Board member tasks...")
-            try:
-                # Use asyncio.gather to run them concurrently
-                member_results_list = await asyncio.gather(*member_task_coroutines, return_exceptions=True)
-                logger.info(f"Clip {clip_id}: Finished gathering member tasks.")
-            except Exception as gather_err:
-                 logger.error(f"Clip {clip_id}: Error during asyncio.gather for member tasks: {gather_err}", exc_info=True)
-                 clip["ai_board_error"] = f"Failed to gather member tasks: {gather_err}"
-                 # Handle potential errors returned by gather itself if return_exceptions=False
+                # Run the async analysis function for the current clip
+                try:
+                     # asyncio.run creates its own event loop
+                     # This will BLOCK the Streamlit thread until run_ai_board_analysis_for_clip completes
+                     updated_clip = asyncio.run(
+                          self.run_ai_board_analysis_for_clip(
+                              clip_data.copy(), project, board_config
+                          )
+                     )
+                     updated_project_clips.append(updated_clip)
 
-        # Process the list of results (or exceptions)
-        processed_member_results = {} # Structure: { member_key: { task_name: {status: ..., result/error: ...} } }
-        for i, result_or_exc in enumerate(member_results_list):
-            if isinstance(result_or_exc, Exception):
-                # Handle exceptions raised during gather (if return_exceptions=True)
-                 # Try to identify which task failed from coroutine info (difficult)
-                 # This indicates a failure within the task function before it returned a dict
-                 logger.error(f"Clip {clip_id}: Exception from gathered task {i}: {result_or_exc}", exc_info=result_or_exc)
-                 # Store a generic error? Find original task? For now, log it.
-            elif isinstance(result_or_exc, dict) and "member_key" in result_or_exc and "task" in result_or_exc:
-                member_key = result_or_exc["member_key"]
-                task_name = result_or_exc["task"]
-                processed_member_results.setdefault(member_key, {})[task_name] = result_or_exc
-            else:
-                 # Unexpected result type from gather
-                 logger.warning(f"Clip {clip_id}: Unexpected item in gathered results list at index {i}: {result_or_exc}")
+                     # Optional: Save results immediately to DB (if function exists)
+                     if update_clip_data(updated_clip["id"], updated_clip):
+                         logger.debug(f"Saved AI Board results for clip {updated_clip['id']} to DB.")
+                     else:
+                         logger.error(f"Failed to save AI Board results for clip {updated_clip['id']} to DB.")
+                     processed_count += 1
 
-        # Store raw results in the clip
-        clip["ai_board_raw_results"] = processed_member_results
+                     if updated_clip.get("ai_board_status") != "completed":
+                          error_count += 1
 
+                except Exception as analysis_exc:
+                     logger.error(f"Fatal error running AI Board analysis for clip {clip_id}: {analysis_exc}", exc_info=True)
+                     error_count += 1
+                     # Add error info to the original clip and append it
+                     clip_data["ai_board_error"] = f"Analysis execution failed: {analysis_exc}"
+                     clip_data["ai_board_status"] = "execution_error"
+                     updated_project_clips.append(clip_data)
 
-        # --- Synthesize Results (Chairperson) ---
-        final_clip_updates = {} # Store synthesized results here
-        if chairperson_config and processed_member_results:
-            chair_provider = chairperson_config["provider"]
-            chair_model = chairperson_config["model"]
-            chair_key = f"{chair_provider}:{chair_model}"
-            logger.info(f"Clip {clip_id}: Running synthesis with Chairperson {chair_key}")
+                # Update progress bar
+                progress = (i + 1) / len(clips)
+                progress_bar.progress(progress, text=f"Analyzed {i+1}/{len(clips)} clips...")
 
-            # Prepare input for the chairperson summarizing member results
-            synthesis_context = (
-                f"Acting as Chairperson AI. Synthesize the following board member analysis results for a video clip ({clip.get('start', 0):.1f}s-{clip.get('end', 0):.1f}s). "
-                "Consolidate scores, tags, and recommendations. Focus on highest scores and actionable insights. Handle potential errors or missing data gracefully.\n\n"
-                "Board Member Results (JSON):\n"
-                f"{json.dumps(processed_member_results, indent=2)}\n\n" # Include raw results structure
-                "Synthesized Output Task: Provide ONLY a valid JSON object with keys: "
-                "'ai_viral_score' (int 0-100 or null if not analyzed), "
-                "'ai_monetization_score' (int 0-100 or null if not analyzed), "
-                "'ai_tags' (list of unique relevant strings), "
-                "'ai_recommendations' (list of unique actionable strings), "
-                "'chairperson_summary' (string, brief summary of key findings)."
-                "\njson\n{\n  \"ai_viral_score\": ...,\n  ...\n}\n" # Hint structure
-            )
+            # Update the project dictionary in session state or trigger a reload
+            # For now, assume the caller handles project state update based on updated_project_clips
+            # A common pattern is to update the database and then st.rerun()
 
-            # Determine if chairperson needs image
-            chair_images = None
-            chair_model_info = self.model_registry.get_model_info(chair_provider, chair_model)
-            if base64_image and chair_model_info and "image" in chair_model_info.get("capabilities", []):
-                 chair_images = [base64_image]
+            status_placeholder.success(f"AI Board analysis complete. Processed: {processed_count}, Errors: {error_count}.")
+            progress_bar.progress(1.0, text="Analysis Complete!")
+            time.sleep(2) # Allow user to see completion message
+            progress_bar.empty()
+            status_placeholder.empty()
 
-            try:
-                synthesis_response_text = await self.model_manager.analyze_with_model(
-                    provider=chair_provider,
-                    model_name=chair_model,
-                    prompt=synthesis_context,
-                    images=chair_images,
-                    temperature=0.3, # Lower temp for consistent synthesis
-                    max_tokens=DEFAULT_MAX_TOKENS, # Allow enough tokens for summary
-                    timeout=DEFAULT_API_TIMEOUT,
-                    format_type="json", # Request JSON
-                )
+            # Force Streamlit to rerun the script to reflect updated clip data
+            # This assumes clip data is reloaded from the source (e.g., DB) at the start of the script
+            st.rerun()
 
-                logger.debug(f"Chairperson raw response for clip {clip_id}: {synthesis_response_text[:300]}...")
-
-                if synthesis_response_text.startswith("Error:"):
-                    logger.error(f"Clip {clip_id} - Chairperson {chair_key}: API Error - {synthesis_response_text}")
-                    final_clip_updates["ai_board_synthesis_error"] = f"Chairperson API Error: {synthesis_response_text}"
-                else:
-                    # Parse Chairperson's JSON response
-                    try:
-                        json_start = synthesis_response_text.find("{")
-                        json_end = synthesis_response_text.rfind("}")
-                        if json_start != -1 and json_end != -1 and json_end > json_start:
-                            clean_response = synthesis_response_text[json_start : json_end + 1]
-                            synth_result = json.loads(clean_response)
-
-                            # Safely extract and validate fields
-                            # Use .get with defaults, handle potential None values from JSON
-                            viral_score = synth_result.get("ai_viral_score")
-                            monet_score = synth_result.get("ai_monetization_score")
-
-                            final_clip_updates["ai_viral_score"] = max(0, min(100, int(viral_score))) if viral_score is not None else None
-                            final_clip_updates["ai_monetization_score"] = max(0, min(100, int(monet_score))) if monet_score is not None else None
-
-                            # Combine and deduplicate tags/recommendations (ensure they are lists)
-                            new_tags = synth_result.get("ai_tags", [])
-                            final_clip_updates["ai_tags"] = sorted(list(set(clip.get("ai_tags", []) + (new_tags if isinstance(new_tags, list) else []))))
-
-                            new_recs = synth_result.get("ai_recommendations", [])
-                            final_clip_updates["ai_recommendations"] = sorted(list(set(clip.get("ai_recommendations", []) + (new_recs if isinstance(new_recs, list) else []))))
-
-                            final_clip_updates["ai_board_summary"] = synth_result.get("chairperson_summary", "No summary provided.")
-
-                            logger.info(f"Clip {clip_id}: Chairperson synthesis successful.")
-
-                        else:
-                            raise json.JSONDecodeError("JSON object markers not found", synthesis_response_text, 0)
-
-                    except (json.JSONDecodeError, ValueError, TypeError) as e:
-                        logger.error(f"Clip {clip_id} - Chairperson {chair_key}: JSON/Validation Error - {e}. Raw: '{synthesis_response_text[:250]}...'")
-                        final_clip_updates["ai_board_synthesis_error"] = f"Chairperson JSON/Validation Error: {e}"
-
-            except Exception as e:
-                 logger.error(f"Clip {clip_id} - Chairperson {chair_key}: Unexpected failure during synthesis call - {e}", exc_info=True)
-                 final_clip_updates["ai_board_synthesis_error"] = f"Chairperson synthesis failed: {e}"
-
-        # Update the clip dictionary with synthesized results
-        clip.update(final_clip_updates)
-        if "ai_board_error" not in clip and "ai_board_synthesis_error" not in clip:
-             clip["ai_board_status"] = "completed" # Mark successful completion
-        elif "ai_board_synthesis_error" in clip:
-             clip["ai_board_status"] = "synthesis_failed"
-        else: # General board error
-             clip["ai_board_status"] = "analysis_failed"
-
-
-        logger.debug(f"Clip {clip_id} AI Board analysis finished. Status: {clip.get('ai_board_status')}")
-        return clip
-
-    # --- Streamlit UI Method ---
-
-    # Helper function to display basic clip details (assuming similar usage elsewhere)
-    def _display_clip_details(self, clip: Dict):
-        """Helper to show core clip info in the UI."""
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Score", clip.get("score", "N/A"))
-        col2.metric("Start (s)", f"{clip.get('start', 0):.1f}")
-        col3.metric("End (s)", f"{clip.get('end', 0):.1f}")
-        st.markdown(f"**Tag:** {clip.get('tag', 'N/A')}")
-        st.markdown(f"**Category:** {clip.get('category', 'N/A')}")
-        st.markdown(f"**Quip:** *{clip.get('quip', 'N/A')}*")
-        # Optionally show thumbnail if needed here
-        # thumb = clip.get('thumbnail')
-        # if thumb and os.path.exists(thumb):
-        #    st.image(thumb, width=200)
-
-    def display_ai_board_ui(self, project: Dict, board_config: Dict):
-        """
-        Renders the AI Board tab UI in Streamlit.
-        Handles triggering analysis and displaying results per clip.
-
-        Args:
-            project: The current project dictionary containing clips and settings.
-            board_config: The AI Board configuration dictionary.
-        """
-        st.subheader("🧠 AI Board of Directors Analysis")
-        st.caption(
-            "Leverage multiple AI models for deeper clip analysis. "
-            "Configure members, tasks, and chairperson in 'AI Model Configuration'."
-        )
-
-        clips = project.get("clips", [])
-        project_id = project.get("id", "unknown_project") # Need project ID for unique keys
-
-        if not clips:
-            st.info("Load a project with clips to enable AI Board analysis.")
-            return
-
-        # Check board configuration status
-        board_enabled = board_config.get("board_enabled", False)
-        members = board_config.get("board_members", [])
-        tasks = board_config.get("board_tasks", [])
-        chairperson = board_config.get("chairperson")
-
-        if not board_enabled:
-            st.warning("AI Board is disabled. Enable and configure it in the 'AI Model Configuration' section.")
-            return
-        if not members:
-            st.warning("No AI Board members selected. Add models in 'AI Model Configuration'.")
-            return
-        if not tasks:
-            st.warning("No AI Board tasks selected. Choose tasks in 'AI Model Configuration'.")
-            return
-        # Chairperson is optional for analysis, but required for synthesis
-        if not chairperson:
-            st.info("No 'Chairperson' model selected for synthesis. Analysis will run, but results won't be consolidated.")
-
-        # Display current configuration
-        st.markdown("---")
-        with st.expander("Current AI Board Configuration", expanded=False):
-            member_str = ", ".join([f'{m["provider"]}:{m["model"]}' for m in members])
-            st.write(f"**Members ({len(members)}):** {member_str if member_str else 'None'}")
-            st.write(f"**Tasks:** {', '.join(tasks) if tasks else 'None'}")
-            chair_str = f'{chairperson["provider"]}:{chairperson["model"]}' if chairperson else 'None Selected'
-            st.write(f"**Chairperson:** {chair_str}")
-        st.markdown("---")
-
-        # --- Analysis Trigger Button ---
-        analyze_all_button_key = f"run_ai_board_all_{project_id}"
-        if st.button("🚀 Run AI Board Analysis on All Clips", type="primary", use_container_width=True, key=analyze_all_button_key):
-
-            # Initialize progress tracking
-            progress_bar = st.progress(0.0, text="Initializing AI Board analysis...")
-            status_placeholder = st.empty()
-            processed_count = 0
-            error_count = 0
-
-            # Create a new event loop for this specific batch analysis process
-            # WARNING: Running extensive async operations triggered by a Streamlit button click
-            #          blocks the UI thread unless handled carefully (e.g., running in a separate thread).
-            #          The following pattern attempts to run the async logic sequentially per clip
-            #          but uses asyncio.run which might block. A better approach for long tasks
-            #          involves background tasks/queues or Streamlit's experimental threading features.
-            #          For this refactor, we stick to a simpler (potentially blocking) sequential approach.
-            #
-            # A simple sequential approach:
-            updated_project_clips = [] # Collect updated clips
-            try:
-                for i, clip_data in enumerate(clips):
-                    clip_id = clip_data.get("id", f"index_{i}")
-                    status_placeholder.text(f"Analyzing clip {i+1}/{len(clips)} (ID: {clip_id})...")
-
-                    # Run the async analysis function for the current clip
-                    try:
-                         # asyncio.run creates its own event loop
-                         # This will BLOCK the Streamlit thread until run_ai_board_analysis_for_clip completes
-                         updated_clip = asyncio.run(
-                              self.run_ai_board_analysis_for_clip(
-                                  clip_data.copy(), project, board_config
-                              )
-                         )
-                         updated_project_clips.append(updated_clip)
-
-                         # Optional: Save results immediately to DB (if function exists)
-                         if update_clip_data(updated_clip["id"], updated_clip):
-                             logger.debug(f"Saved AI Board results for clip {updated_clip['id']} to DB.")
-                         else:
-                             logger.error(f"Failed to save AI Board results for clip {updated_clip['id']} to DB.")
-                         processed_count += 1
-
-                         if updated_clip.get("ai_board_status") != "completed":
-                              error_count += 1
-
-                    except Exception as analysis_exc:
-                         logger.error(f"Fatal error running AI Board analysis for clip {clip_id}: {analysis_exc}", exc_info=True)
-                         error_count += 1
-                         # Add error info to the original clip and append it
-                         clip_data["ai_board_error"] = f"Analysis execution failed: {analysis_exc}"
-                         clip_data["ai_board_status"] = "execution_error"
-                         updated_project_clips.append(clip_data)
-
-                    # Update progress bar
-                    progress = (i + 1) / len(clips)
-                    progress_bar.progress(progress, text=f"Analyzed {i+1}/{len(clips)} clips...")
-
-                # Update the project dictionary in session state or trigger a reload
-                # For now, assume the caller handles project state update based on updated_project_clips
-                # A common pattern is to update the database and then st.rerun()
-
-                status_placeholder.success(f"AI Board analysis complete. Processed: {processed_count}, Errors: {error_count}.")
-                progress_bar.progress(1.0, text="Analysis Complete!")
-                time.sleep(2) # Allow user to see completion message
-                progress_bar.empty()
-                status_placeholder.empty()
-
-                # Force Streamlit to rerun the script to reflect updated clip data
-                # This assumes clip data is reloaded from the source (e.g., DB) at the start of the script
-                st.rerun()
-
-            except Exception as e:
-                 logger.error(f"Error during AI Board batch analysis trigger: {e}", exc_info=True)
-                 st.error(f"An error occurred during the analysis process: {e}")
-                 progress_bar.empty() # Clear progress bar on outer error
-                 status_placeholder.empty()
+        except Exception as e:
+             logger.error(f"Error during AI Board batch analysis trigger: {e}", exc_info=True)
+             st.error(f"An error occurred during the analysis process: {e}")
+             progress_bar.empty() # Clear progress bar on outer error
+             status_placeholder.empty()
 
         # --- Display Results ---
         st.markdown("#### Clip Analysis Results:")

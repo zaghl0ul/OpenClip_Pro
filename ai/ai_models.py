@@ -1877,7 +1877,7 @@ class AIAnalysisModule:
             except Exception as e:
                 logger.error(
                     f"Error preparing image for AI board analysis (clip {clip_id}): {e}", exc_info=True
-                base64_image = None # Ensure it's None on error
+                base64_image = None ) Ensure it's None on error
         elif image_needed and not (thumbnail_path and os.path.exists(thumbnail_path)):
              logger.warning(f"Thumbnail not found or path invalid for clip {clip_id}. Vision models may lack visual context.")
 

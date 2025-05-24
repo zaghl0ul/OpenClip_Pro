@@ -18,9 +18,7 @@ from database import setup_database, get_settings, save_project, load_projects, 
 
 # Import the main AI module initializer and UI components
 from ai import initialize_ai_integration
-from ai.ui_components import (
-    create_api_key_management_ui,
-)  # Import only the API key management UI
+from ai.ui_components import (create_api_key_management_ui,)  # Import only the API key management UI
 
 # --- Setup Logging ---
 logging.basicConfig(

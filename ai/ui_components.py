@@ -12,8 +12,7 @@ from typing import Dict, List, Optional, Any
 from ai.ai_models import (
     ModelRegistry,
     APIKeyManager,
-    fernet,  # Used for API key encryption status check
-)
+    fernet)  # Used for API key encryption status check
 
 # Setup logging
 logger = logging.getLogger(__name__)

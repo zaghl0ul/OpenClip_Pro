@@ -1,0 +1,61 @@
+# OpenClip Pro - Ngrok Configuration Template
+# Copy this file to ngrok.yml and customize as needed
+# Run with: ngrok start --all --config ngrok.yml
+
+# Set your authtoken (get from https://dashboard.ngrok.com/auth)
+# authtoken: YOUR_AUTH_TOKEN_HERE
+
+# Define tunnels
+tunnels:
+  # Main OpenClip Pro application
+  openclip:
+    proto: http
+    addr: 8501
+    inspect: true
+    # Basic authentication (optional)
+    # auth: "username:password"
+    
+    # Bind to specific hostname (paid feature)
+    # hostname: "your-app.ngrok.io"
+    
+    # Request headers to add
+    host_header: "localhost:8501"
+    
+    # Schemes to use
+    schemes:
+      - http
+      - https
+    
+    # Custom subdomain (paid feature)
+    # subdomain: "openclip"
+    
+    # IP restrictions (paid feature)
+    # ip_policy_ref: "your_ip_policy_id"
+
+  # Optional: Separate tunnel for API endpoints
+  # api:
+  #   proto: http
+  #   addr: 8000
+  #   inspect: false
+  #   host_header: "localhost:8000"
+
+# Global settings
+region: us  # us, eu, ap, au, sa, jp, in
+console_ui: true
+console_ui_color: transparent
+log_level: info
+log_format: json
+log: stdout
+
+# Web interface settings
+web_addr: 0.0.0.0:4040
+
+# Update check
+update_check: true
+
+# Heartbeat settings
+heartbeat_interval: 10s
+heartbeat_tolerance: 5s
+
+# Metadata (for organization)
+metadata: '{"app": "openclip_pro", "version": "1.1"}' 

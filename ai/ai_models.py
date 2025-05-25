@@ -877,6 +877,7 @@ class ModelRegistry:
         """Initialize ModelRegistry with optional dynamic model support."""
         self.key_manager = key_manager
         self._gemini_integration = None
+        self._openai_integration = None
         self._dynamic_models_cache = {}
         self._cache_timestamps = {}
         self._cache_duration = 300  # 5 minutes cache
@@ -935,22 +936,55 @@ class ModelRegistry:
         
         return dynamic_models
 
+    def _get_openai_integration(self):
+        if not self._openai_integration and self.key_manager:
+            api_key = self.key_manager.get_key("openai")
+            if api_key:
+                self._openai_integration = OpenAIIntegration(api_key)
+        return self._openai_integration
+
+    def _get_dynamic_openai_vision_models(self) -> List[Dict]:
+        """Fetch dynamic OpenAI vision models from the API."""
+        current_time = time.time()
+        if (
+            "openai_vision" in self._dynamic_models_cache
+            and current_time - self._cache_timestamps.get("openai_vision", 0) < self._cache_duration
+        ):
+            return self._dynamic_models_cache["openai_vision"]
+        openai_integration = self._get_openai_integration()
+        dynamic_models = []
+        if openai_integration and openai_integration.initialized:
+            try:
+                # This is an async method, but ModelRegistry is sync. Use asyncio.run if not in event loop.
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    # If already in an event loop, create a task and run it
+                    dynamic_models = loop.run_until_complete(openai_integration.list_available_vision_models())
+                except RuntimeError:
+                    # Not in an event loop
+                    dynamic_models = asyncio.run(openai_integration.list_available_vision_models())
+                self._dynamic_models_cache["openai_vision"] = dynamic_models
+                self._cache_timestamps["openai_vision"] = current_time
+            except Exception as e:
+                logger.warning(f"Failed to fetch dynamic OpenAI vision models: {e}")
+        return dynamic_models
+
     def list_models_for_provider(self, provider_name_or_key: str) -> List[str]:
-        """Lists model names for a specific provider, including dynamic models."""
         provider_key = provider_name_or_key.lower()
-        
-        # Get static models
         static_models = sorted(list(self.KNOWN_MODELS.get(provider_key, {}).keys()))
-        
         # For Google/Gemini, also fetch dynamic models
         if provider_key == "google":
             dynamic_models = self._get_dynamic_gemini_models()
             dynamic_model_names = [m["model"] for m in dynamic_models]
-            
-            # Combine static and dynamic models, remove duplicates
             all_models = static_models + [name for name in dynamic_model_names if name not in static_models]
             return sorted(all_models)
-        
+        # For OpenAI, fetch dynamic vision models and combine
+        if provider_key == "openai":
+            dynamic_vision_models = self._get_dynamic_openai_vision_models()
+            dynamic_model_names = [m["model"] for m in dynamic_vision_models]
+            all_models = static_models + [name for name in dynamic_model_names if name not in static_models]
+            return sorted(all_models)
         return static_models
 
     def get_model_info(self, provider_name_or_key: str, model_name: str) -> Optional[Dict]:
@@ -976,7 +1010,6 @@ class ModelRegistry:
 
 
     def list_vision_models(self) -> List[Dict]:
-        """Lists all models supporting image input, including dynamic models."""
         vision_models = []
         
         # Get static vision models
@@ -990,6 +1023,12 @@ class ModelRegistry:
         # Add dynamic Gemini vision models
         dynamic_gemini_models = self._get_dynamic_gemini_models()
         for model in dynamic_gemini_models:
+            if "image" in model.get("capabilities", []):
+                vision_models.append(model)
+        
+        # Add dynamic OpenAI vision models
+        dynamic_openai_vision_models = self._get_dynamic_openai_vision_models()
+        for model in dynamic_openai_vision_models:
             if "image" in model.get("capabilities", []):
                 vision_models.append(model)
         
@@ -1046,6 +1085,10 @@ class ModelRegistry:
         # unless specifically marked as free in the API response
         
         return free_models
+
+    def list_providers(self) -> list:
+        """Returns a sorted list of available provider names."""
+        return sorted(self.KNOWN_MODELS.keys())
 
 
 # --- AI Client Factory ---
@@ -1962,7 +2005,7 @@ class AIAnalysisModule:
                         parsed_data = json.loads(clean_response)                        # Validate required keys
                         missing_keys = [k for k in task_details["output_keys"] if k not in parsed_data]
                         if missing_keys:
-                            raise ValueError(f"Missing expected JSON keys: {', '.join(missing_keys)}")raise ValueError(f"Missing expected JSON keys: {', '.join(missing_keys)}")
+                            raise ValueError(f"Missing expected JSON keys: {', '.join(missing_keys)}")
 
                         # Validate score types if applicable
                         score_key = task_details.get("score_key")
@@ -2304,4 +2347,78 @@ def debug_print(message: str) -> None:
     
     # Always log at debug level for debugging via log files
     logger.debug(message)
+
+
+# --- Provider-Specific Integrations ---
+# Wrappers can encapsulate complex initialization or API call logic.
+class OpenAIIntegration:
+    """
+    Handles interaction with the OpenAI client for dynamic model listing.
+    Only returns models that support vision (image/video) analysis.
+    """
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key
+        self.AsyncOpenAI = AsyncOpenAI
+        self.initialized = False
+        self._cached_models = None
+        self._cache_timestamp = 0
+        self._cache_duration = 300  # Cache for 5 minutes
+        if self.AsyncOpenAI and self.api_key:
+            self.initialized = True
+        elif not self.AsyncOpenAI:
+            logger.error("openai package not imported. Cannot initialize OpenAI integration.")
+
+    async def list_available_vision_models(self) -> List[Dict[str, Any]]:
+        """
+        Fetch available OpenAI models that support vision (image) input.
+        Returns a list of dicts with model info.
+        """
+        import re
+        current_time = time.time()
+        if (
+            self._cached_models is not None
+            and current_time - self._cache_timestamp < self._cache_duration
+        ):
+            logger.debug("Using cached OpenAI vision models list")
+            return self._cached_models
+
+        if not self.initialized or not self.AsyncOpenAI or not self.api_key:
+            logger.warning("OpenAI not configured, cannot fetch models")
+            return []
+        try:
+            client = self.AsyncOpenAI(api_key=self.api_key, timeout=DEFAULT_API_TIMEOUT)
+            # Fetch all models
+            models_response = await client.models.list()
+            # The response is a list of model dicts
+            models = models_response.data if hasattr(models_response, "data") else models_response
+            vision_models = []
+            for model in models:
+                # Model name is in model['id'] or model['id']
+                model_id = model.get("id") if isinstance(model, dict) else getattr(model, "id", None)
+                if not model_id:
+                    continue
+                # Heuristic: OpenAI vision models (as of 2024) include:
+                # - gpt-4-vision-preview, gpt-4o, gpt-4o-mini, gpt-4-turbo, etc.
+                # - gpt-4o* and gpt-4-turbo* are vision-capable
+                # - gpt-3.5-turbo is NOT vision-capable
+                # - Exclude instruct, embedding, moderation, etc.
+                if re.match(r"^(gpt-4o|gpt-4-turbo|gpt-4-vision|chatgpt-4o|gpt-4-1106|gpt-4-0125|gpt-4-0613|gpt-4-0314)", model_id):
+                    # Add model info
+                    vision_models.append({
+                        "model": model_id,
+                        "provider": "OpenAI",
+                        "type": "vision",
+                        "quality": "premium" if "4o" in model_id or "turbo" in model_id else "standard",
+                        "requires_api_key": True,
+                        "capabilities": ["text", "image", "json"],
+                        "dynamic": True,
+                    })
+            # Cache results
+            self._cached_models = vision_models
+            self._cache_timestamp = current_time
+            logger.info(f"Successfully fetched {len(vision_models)} OpenAI vision models from API")
+            return vision_models
+        except Exception as e:
+            logger.error(f"Failed to fetch OpenAI models from API: {e}", exc_info=True)
+            return []
 

@@ -1,0 +1,41 @@
+[theme]
+# Theme settings
+primaryColor = "#FF6B6B"
+backgroundColor = "#1A1A1A"
+secondaryBackgroundColor = "#2D2D2D"
+textColor = "#FFFFFF"
+font = "sans serif"
+
+[server]
+# Server configuration for ngrok deployment
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+port = 8501
+address = "0.0.0.0"
+# Allow connections from any host (needed for ngrok)
+enableWebsocketCompression = true
+
+[browser]
+# Browser settings
+gatherUsageStats = false
+serverAddress = "0.0.0.0"
+serverPort = 8501
+
+[runner]
+# Runner settings
+magicEnabled = true
+installTracer = false
+fixMatplotlib = true
+postScriptGC = true
+fastReruns = true
+
+[client]
+# Client settings
+showErrorDetails = true
+toolbarMode = "minimal"
+
+[logger]
+# Logging configuration
+level = "info"
+messageFormat = "%(asctime)s %(levelname)s %(name)s: %(message)s" 
